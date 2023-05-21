@@ -1,0 +1,158 @@
+Description: Udacity IaC servers part
+Parameters:
+  EnvironmentName:
+    Description: An environment name that will be prefixed to resources
+    Type: String
+  LaunchConfigImageId:
+    Description: ImageId used for launching new instances in the autoscaling group
+    Type: String
+    Default: ami-00ddb0e5626798373
+Resources:
+  # VPC:
+  #   Type: AWS::EC2::VPC
+  #   Properties:
+  #     CidrBlock: 10.0.0.0/16
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub ${EnvironmentName}-TEST-VPC
+  # load balancer security group
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Sec group for load balancers in this network
+      VpcId:
+        # !Ref VPC # just for test purposes
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC-ID # this is the exported name from our `network.yaml` file
+      # define sg rules for outbound traffic
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80 # http
+          ToPort: 80 # http
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+      # define sg rules for inbound traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80 # http
+          ToPort: 80 # http
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+  # web servers security group
+  WebServersSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Sec group for ec2 instances in this network
+      VpcId:
+        # !Ref VPC # just for test purposes
+        Fn::ImportValue: !Sub ${EnvironmentName}-VPC-ID
+      # define sg rules for outbound traffic (allow instances to access the internet using http)
+      SecurityGroupEgress:
+        IpProtocol: tcp
+        FromPort: 0
+        ToPort: 65535 # all ports
+        CidrIp: 0.0.0.0/0 # the destination traffic cidr
+      # define sg rules for inbound traffic (allow only http and ssh)
+      SecurityGroupIngress:
+        # probably gonna remove this later ?? let's see
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        # allow ssh traffic so that we can access our instances from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        # local port for our application
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+  # launch configuration that autoscaling uses when launching new instances
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      BlockDeviceMappings:
+        - DeviceName: /dev/sdk
+          Ebs:
+            VolumeSize: 10 # GBs
+      ImageId: !Ref LaunchConfigImageId
+      InstanceType: t3.small
+      KeyName: why-deleted
+      SecurityGroups:
+        - !Ref WebServersSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt-get update -y
+          sudo apt-get install apache2 -y
+          sudo systemctl start apache2.service
+          cd /var/www/html
+          echo "My Demo Web Server Up and Running!" > index.html
+  # launch an aws autoscaling group with above configuration; this defines a "policy" for our instances
+  WebAppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchConfigurationName: !Ref WebAppLaunchConfig
+      MinSize: 1
+      MaxSize: 1
+      VPCZoneIdentifier:
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PUB-NETS
+      HealthCheckGracePeriod: 60
+      HealthCheckType: ELB
+      TargetGroupARNs:
+        - Ref: WebAppTargetGroup
+  # create a load balancer and attach it to our autoscaling group
+  WebAppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        # !Ref PublicSubnets # this is NOT gonna work
+        # Fn::ImportValue: !Sub ${EnvironmentName}-PUB-NETS # NOR this
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PUB1-SN
+        - Fn::ImportValue: !Sub ${EnvironmentName}-PUB2-SN
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10 # interval (in seconds) between health checks of targets (instances in our case)
+      HealthCheckPath: / # ping our instances on this path, it's a web server so that makes sense
+      HealthCheckProtocol: HTTP # port that the LB uses for health checks
+      HealthCheckTimeoutSeconds: 8 # 8 seconds, if no response the target is considered a failure and it will be replaced
+      HealthyThresholdCount: 2 # an instance has to success in 2 consecutive health check requests to be considered healthy
+      Port: 8080 # nothing to do with health check, just port used to route traffic to targets(instances)
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5 # same as `HealthyThresholdCount` but for considering a “target failure”
+      VpcId:
+        Fn::ImportValue:
+          Fn::Sub: ${EnvironmentName}-VPC-ID
+  # create a load balancer listener which defines rules
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      # why are we specifying these actions twice!!
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      LoadBalancerArn: !Ref WebAppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+  # did NOT fully understand this resource
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      Conditions:
+        - Field: path-pattern
+          Values: [/]
+      ListenerArn: !Ref HTTPListener
+      Priority: 1
